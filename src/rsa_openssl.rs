@@ -179,7 +179,7 @@ pub struct AESShadower<RT : RSATruster> {
   /// key to send sym k
   keyexch : Arc<PKey>,
   /// is active
-  mode : bool,
+  mode : ASymSymMode,
   _p : PhantomData<RT>,
 
 }
@@ -187,8 +187,9 @@ pub struct AESShadower<RT : RSATruster> {
 // Crypter is not send but lets try
 unsafe impl<RT : RSATruster> Send for AESShadower<RT> {}
 
-
-// TODO const in trait
+// TODO if bincode get include use it over ASYMSYMMode isnstead of those three constant
+const SMODE_ASYM_ONLY_ENABLE : u8 = 2;
+// TODO 
 const SMODE_ENABLE : u8 = 1;
 // TODO const in trait
 const SMODE_DISABLE : u8 = 0;
@@ -213,7 +214,7 @@ impl<RT : RSATruster> AESShadower<RT> {
       finalize : false,
       // asym key to established simkey
       keyexch : enckey,
-      mode : false,
+      mode : ASymSymMode::None,
       _p : PhantomData,
     }
   }
@@ -235,7 +236,7 @@ impl<RT : RSATruster> AESShadower<RT> {
       finalize : false,
       // asym key to established simkey
       keyexch : enckey,
-      mode : true,
+      mode : ASymSymMode::ASymSym, // default to ASymSym
       _p : PhantomData,
     }
   }
@@ -253,21 +254,35 @@ impl<RT : RSATruster> AESShadower<RT> {
   }
 
 
-  fn ciph_cont(pkey : &PKey, to_ciph : &[u8]) -> Vec<u8> {
-    pkey.encrypt(to_ciph) // TODO check padding options and use encrypt_with_padding
+
+  #[inline]
+  fn crypt (&mut self, m : &[u8], sym : bool) -> Vec<u8> {
+    if sym {
+      self.crypter.update(m)
+    } else {
+      (*self.keyexch).encrypt(m)
+    }
   }
-  fn unciph_cont(pkey : &PKey, to_ciph : &[u8]) -> Option<Vec<u8>> {
-    Some(pkey.decrypt(to_ciph)) // TODO what happen if no private key in pkey???
+  #[inline]
+  fn crypt_buf (&mut self, sym : bool) -> Vec<u8> {
+    if sym {
+      self.crypter.update(&self.buf[..])
+    } else {
+      (*self.keyexch).encrypt(&self.buf[..])
+    }
   }
 
   /// warning iter sim does not use a salt, please add one if needed (common use case is one key
   /// per message and salt is useless)
   /// TODO add try everywhere plus check if readwrite ext is not better indexwise
   fn shadow_iter_sim<W : Write> (&mut self, m : &[u8], w : &mut W) -> IoResult<usize> {
-    if self.mode {
+
+    match self.mode {
+    ASymSymMode::ASymSym | ASymSymMode::ASymOnly => {
+      let sym = self.mode == ASymSymMode::ASymSym;
     // best case
     if self.bufix == 0 && m.len() == <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
-      let r = self.crypter.update(m);
+      let r = self.crypt(m,sym);
       w.write(&r[..])
     } else {
       let mut has_next = true;
@@ -284,7 +299,7 @@ impl<RT : RSATruster> AESShadower<RT> {
           let mix = self.buf.len() - self.bufix;
           self.buf[self.bufix..].clone_from_slice(&mu[..mix]); // TODO no need to copy if same length : update directly on mu then update mu
           mu = &mu[mix..];
-          let r = self.crypter.update(&self.buf[..]);
+          let r = self.crypt_buf(sym);
           res += try!(w.write(&r[..]));
           res -= self.bufix;
           self.bufix = 0;
@@ -292,15 +307,37 @@ impl<RT : RSATruster> AESShadower<RT> {
       }
       Ok(res)
     }
-    } else {
+    },
+    ASymSymMode::None => {
       w.write(m)
+    },
+    }
+  }
+
+  #[inline]
+  fn decrypt_buf (&mut self, ix : usize, sym : bool) -> Vec<u8> {
+    if sym {
+      self.crypter.update(&self.buf[..ix])
+    } else {
+      (*self.keyexch).decrypt(&self.buf[..ix])
+    }
+  }
+ #[inline]
+  fn dfinalize (&mut self, sym : bool) -> Vec<u8> {
+    if sym {
+      self.crypter.finalize()
+    } else {
+      Vec::new()
     }
   }
 
 
   /// same as write no salt (key should be unique or read a salt
   fn read_shadow_iter_sim<R : Read> (&mut self, r : &mut R, resbuf: &mut [u8]) -> IoResult<usize> {
-    if self.mode {
+    match self.mode {
+    ASymSymMode::ASymSym | ASymSymMode::ASymOnly => {
+      let sym = self.mode == ASymSymMode::ASymSym;
+   
 /*      if self.bufix == self.buf.len() {
         return Ok(0); // has been finalized
       }*/
@@ -318,7 +355,7 @@ impl<RT : RSATruster> AESShadower<RT> {
         }
         let dec = if self.bufix < <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
           // nothing to read, finalize
-          let dec = self.crypter.finalize();
+          let dec = self.dfinalize(sym);
           self.finalize = true;
 //          self.crypter.init(Mode::Decrypt,&self.key[..],&self.buf[..]); // only for next finalize to return 0
           if dec.len() == 0 {
@@ -327,7 +364,8 @@ impl<RT : RSATruster> AESShadower<RT> {
           dec
         } else {
           // decode - call directly finalize as we have buf of blocksize
-          let dec = self.crypter.update(&self.buf[..self.bufix]);
+          let bix = self.bufix;
+          let dec = self.decrypt_buf(bix,sym);
           if dec.len() == 0 {
             self.bufix = 0;
             return self.read_shadow_iter_sim(r, resbuf);
@@ -356,24 +394,31 @@ impl<RT : RSATruster> AESShadower<RT> {
         self.bufix = 0;
         Ok(tow)
       }
-    } else {
+    },
+    ASymSymMode::None => {
       r.read(resbuf)
+    },
     }
  
   }
   fn c_finalize<W : Write> (&mut self, w : &mut W) -> IoResult<()> {
     // encrypt remaining content in buffer and write, + call to writer flush
-    if self.mode {
+    match self.mode {
+    ASymSymMode::ASymSym | ASymSymMode::ASymOnly => {
+      let sym = self.mode == ASymSymMode::ASymSym;
       if self.bufix > 0 {
-        let r = self.crypter.update(&self.buf[..self.bufix]);
+        let bix = self.bufix;
+        let r = self.decrypt_buf(bix,sym);
         try!(w.write(&r[..]));
       }
       // always finalize (padding)
-      let r2 = self.crypter.finalize();
+      let r2 = self.dfinalize(sym);
       if r2.len() > 0 {
         try!(w.write(&r2[..]));
       }
       self.finalize = false;
+    },
+    _ => (),
     }
     //w.flush()
     Ok(())
@@ -382,27 +427,58 @@ impl<RT : RSATruster> AESShadower<RT> {
 
 }
 
+#[derive(Debug, PartialEq, Eq, Clone,RustcEncodable,RustcDecodable)]
+pub enum ASymSymMode {
+  /// standard for encoding, a symetric key send into an asym envelope (good for big message)
+  ASymSym, 
+  /// only asym encoding : only use for small messages
+  ASymOnly,
+  /// No enc
+  None,
+}
 
 impl<RT : RSATruster> Shadow for AESShadower<RT> {
-  type ShadowMode = bool; // TODO shadowmode allowing head to be RSA only
+  type ShadowMode = ASymSymMode; // TODO shadowmode allowing head to be RSA only
 
   #[inline]
   fn set_mode (&mut self, sm : Self::ShadowMode) {
-    self.mode = sm
+    self.mode = sm;
+    match self.mode {
+    ASymSymMode::ASymSym => {
+        if self.buf.len() != <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
+          self.buf = vec![0;<RT as RSATruster>::CRYPTER_BLOCK_SIZE];
+        }
+    },
+    ASymSymMode::ASymOnly => {
+
+        if self.buf.len() != <RT as RSATruster>::CRYPTER_KEY_ENC_SIZE {
+          self.buf = vec![0;<RT as RSATruster>::CRYPTER_KEY_ENC_SIZE];
+        }
+    },
+    _ => (),
+    }
+ 
   }
   #[inline]
   fn get_mode (&self) -> Self::ShadowMode {
-    self.mode
+    self.mode.clone()
   }
   fn send_shadow_simkey<W : Write>(w : &mut W, m : Self::ShadowMode ) -> IoResult<()> {
-    if m {
+    match m {
+
+    ASymSymMode::ASymSym => {
       try!(w.write(&[SMODE_ENABLE]));
       let k = AESShadower::<RT>::static_shadow_simkey();
       try!(w.write(&k[..]));
       let salt = AESShadower::<RT>::static_shadow_salt();
       try!(w.write(&salt[..]));
-    } else {
+    },
+    ASymSymMode::ASymOnly => {
+      try!(w.write(&[SMODE_ASYM_ONLY_ENABLE]));
+    },
+    ASymSymMode::None => {
       try!(w.write(&[SMODE_DISABLE]));
+    },
     }
     Ok(())
   }
@@ -411,8 +487,11 @@ impl<RT : RSATruster> Shadow for AESShadower<RT> {
     let mut res = Self::new_empty();
     let mut tag = [0];
     try!(r.read(&mut tag));
-    if tag[0] == SMODE_ENABLE {
-      res.mode = true;
+    if tag[0]  == SMODE_DISABLE {
+      res.mode = ASymSymMode::None;
+      Ok(res)
+    } else {
+      res.mode = ASymSymMode::ASymSym;
       let mut enckey = vec![0;<RT as RSATruster>::CRYPTER_KEY_SIZE]; // enc from 32 to 256
       try!(r.read(&mut enckey[..]));
       let mut salt = vec![0;<RT as RSATruster>::CRYPTER_BLOCK_SIZE]; // enc from 32 to 256
@@ -422,17 +501,15 @@ impl<RT : RSATruster> Shadow for AESShadower<RT> {
       } else {
         res.crypter.init(Mode::Decrypt,&enckey[..],&salt[..]);
       };
+      if res.buf.len() != <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
+          res.buf = vec![0;<RT as RSATruster>::CRYPTER_BLOCK_SIZE];
+      }
       res.crypter.pad(true);
       res.key = enckey;
       res.buf = salt;
       res.bufix = 0;
-      res.mode = true;
-      Ok(res)
-    } else {
-      res.mode = false;
       Ok(res)
     }
-
   }
 
 
@@ -446,15 +523,16 @@ impl<RT : RSATruster> Shadow for AESShadower<RT> {
 impl<RT : RSATruster> ExtWrite for AESShadower<RT> {
   #[inline]
   fn write_header<W : Write>(&mut self, w : &mut W) -> IoResult<()> {
-
-    if self.mode {
+    match self.mode {
+    ASymSymMode::ASymSym => {
+ 
       // change salt each time (if to heavy a counter to change each n time
       try!(w.write(&[SMODE_ENABLE]));
       OsRng::new().unwrap().fill_bytes(&mut self.buf);
       try!(w.write(&self.buf[..]));
     if self.key.len() == 0 { // TODO renew of simkey on write end??
       self.key = Self::static_shadow_simkey();
-      let enckey = AESShadower::<RT>::ciph_cont(&(*self.keyexch), &self.key[..]);
+      let enckey = (*self.keyexch).encrypt(&self.key[..]);
  
       assert!(enckey.len() == <RT as RSATruster>::CRYPTER_KEY_ENC_SIZE);
           try!(w.write(&enckey));
@@ -462,8 +540,15 @@ impl<RT : RSATruster> ExtWrite for AESShadower<RT> {
 
       self.crypter.init(Mode::Encrypt,&self.key[..],&self.buf[..]);
       self.bufix = 0;
-    } else {
+    },
+    ASymSymMode::None => {
+
       try!(w.write(&[SMODE_DISABLE]));
+    },
+    ASymSymMode::ASymOnly => {
+      try!(w.write(&[SMODE_ASYM_ONLY_ENABLE]));
+      self.bufix = 0;
+    },
     }
     Ok(())
   }
@@ -473,7 +558,6 @@ impl<RT : RSATruster> ExtWrite for AESShadower<RT> {
     self.shadow_iter_sim (cont, w)
   }
 
-
   #[inline]
   fn flush_into<W : Write>(&mut self, _ : &mut W) -> IoResult<()> {
     Ok(())
@@ -481,7 +565,7 @@ impl<RT : RSATruster> ExtWrite for AESShadower<RT> {
  
   #[inline]
   fn write_end<W : Write>(&mut self, w : &mut W) -> IoResult<()> {
-    if self.mode { 
+    if let ASymSymMode::ASymSym = self.mode {
       self.c_finalize(w)
     } else {
       //w.flush()
@@ -512,31 +596,34 @@ impl<RT : RSATruster> ExtRead for AESShadower<RT> {
             s += r;
           }
           // init key
-          let okey = AESShadower::<RT>::unciph_cont(&(*self.keyexch), &enckey[..]);
-          match okey {
-            Some(k) => {
-              if k.len() == 0 {
-                return Err(IoError::new (
+          let k = (*self.keyexch).decrypt(&enckey[..]);
+          if k.len() == 0 {
+             return Err(IoError::new (
                   IoErrorKind::Other,
                   "Cannot read Rsa Shadow key",
-                ));
-              }
-
-              self.key = k
-            },
-            None => return Err(IoError::new (
-              IoErrorKind::Other,
-              "Cannot read Rsa Shadow key",
-            )),
+               ));
           }
+
+          self.key = k
       }
       
       self.crypter.init(Mode::Decrypt,&self.key[..],&self.buf[..]);
         self.bufix = 0;
-        self.mode = true;
+        self.mode = ASymSymMode::ASymSym;
+        if self.buf.len() != <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
+          self.buf = vec![0;<RT as RSATruster>::CRYPTER_BLOCK_SIZE];
+        }
+
+      Ok(())
+    } else if tag[0] == SMODE_ASYM_ONLY_ENABLE {
+        self.mode = ASymSymMode::ASymOnly;
+        if self.buf.len() != <RT as RSATruster>::CRYPTER_KEY_ENC_SIZE {
+          self.buf = vec![0;<RT as RSATruster>::CRYPTER_KEY_ENC_SIZE];
+        };
+        self.bufix = 0;
       Ok(())
     } else {
-      self.mode = false;
+        self.mode = ASymSymMode::None;
       Ok(())
     }
   }
@@ -647,15 +734,15 @@ impl Peer for RSAPeerTest {
   }
   #[inline]
   fn default_message_mode (&self) -> <Self::Shadow as Shadow>::ShadowMode {
-    true
+    ASymSymMode::ASymSym
   }
   #[inline]
   fn default_header_mode (&self) -> <Self::Shadow as Shadow>::ShadowMode {
-    true // TODO add a sym only mode
+    ASymSymMode::ASymSym// TODO add a sym only mode
   }
   #[inline]
   fn default_auth_mode (&self) ->  <Self::Shadow as Shadow>::ShadowMode {
-    false
+    ASymSymMode::None
   }
 
 }
@@ -664,7 +751,7 @@ impl Peer for RSAPeerTest {
 
 #[cfg(test)]
 fn rsa_shadower_test (input_length : usize, write_buffer_length : usize,
-read_buffer_length : usize, smode : bool) {
+read_buffer_length : usize, smode : ASymSymMode) {
 
   let to_p = RSAPeerTest::new(1);
   shadower_test(to_p,input_length,write_buffer_length,read_buffer_length,smode);
@@ -673,7 +760,7 @@ read_buffer_length : usize, smode : bool) {
 
 #[test]
 fn rsa_shadower1_test () {
-  let smode = false;
+  let smode = ASymSymMode::None;
   let input_length = 256;
   let write_buffer_length = 256;
   let read_buffer_length = 256;
@@ -682,7 +769,7 @@ fn rsa_shadower1_test () {
 
 #[test]
 fn rsa_shadower2_test () {
-  let smode = false;
+  let smode = ASymSymMode::None;
   let input_length = 7;
   let write_buffer_length = 256;
   let read_buffer_length = 256;
@@ -691,7 +778,7 @@ fn rsa_shadower2_test () {
 
 #[test]
 fn rsa_shadower3_test () {
-  let smode = false;
+  let smode = ASymSymMode::None;
   let input_length = 125;
   let write_buffer_length = 12;
   let read_buffer_length = 68;
@@ -701,7 +788,7 @@ fn rsa_shadower3_test () {
 
 #[test]
 fn rsa_shadower4_test () {
-  let smode = false;
+  let smode = ASymSymMode::None;
   let input_length = 125;
   let write_buffer_length = 68;
   let read_buffer_length = 12;
@@ -709,7 +796,7 @@ fn rsa_shadower4_test () {
 }
 #[test]
 fn rsa_shadower5_test () {
-  let smode = true;
+  let smode = ASymSymMode::ASymSym;
   let input_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
   let write_buffer_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
   let read_buffer_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
@@ -718,7 +805,7 @@ fn rsa_shadower5_test () {
 
 #[test]
 fn rsa_shadower6_test () {
-  let smode = true;
+  let smode = ASymSymMode::ASymSym;
   let input_length = 7;
   let write_buffer_length = 256;
   let read_buffer_length = 256;
@@ -727,7 +814,7 @@ fn rsa_shadower6_test () {
 
 #[test]
 fn rsa_shadower7_test () {
-  let smode = true;
+  let smode = ASymSymMode::ASymSym;
   let input_length = 125;
   let write_buffer_length = 12;
   let read_buffer_length = 68;
@@ -736,15 +823,52 @@ fn rsa_shadower7_test () {
 
 #[test]
 fn rsa_shadower8_test () {
-  let smode = true;
+  let smode = ASymSymMode::ASymSym;
   let input_length = 125;
   let write_buffer_length = 68;
   let read_buffer_length = 12;
   rsa_shadower_test (input_length, write_buffer_length, read_buffer_length, smode);
 }
+#[test]
+fn rsa_shadower9_test () {
+  let smode = ASymSymMode::ASymOnly;
+  //let input_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
+  let input_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
+  let write_buffer_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
+  let read_buffer_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
+  rsa_shadower_test (input_length, write_buffer_length, read_buffer_length, smode);
+}
+/*
+#[test]
+fn rsa_shadowera_test () {
+  let smode = ASymSymMode::ASymOnly;
+  let input_length = 7;
+  let write_buffer_length = 256;
+  let read_buffer_length = 256;
+  rsa_shadower_test (input_length, write_buffer_length, read_buffer_length, smode);
+}
+
+#[test]
+fn rsa_shadowerb_test () {
+  let smode = ASymSymMode::ASymOnly;
+  let input_length = 125;
+  let write_buffer_length = 12;
+  let read_buffer_length = 68;
+  rsa_shadower_test (input_length, write_buffer_length, read_buffer_length, smode);
+}
+
+#[test]
+fn rsa_shadowerc_test () {
+  let smode = ASymSymMode::ASymOnly;
+  let input_length = 125;
+  let write_buffer_length = 68;
+  let read_buffer_length = 12;
+  rsa_shadower_test (input_length, write_buffer_length, read_buffer_length, smode);
+}
+*/
 
 #[cfg(test)]
-fn tunnel_public_test(nbpeer : usize, tmode : TunnelShadowMode, input_length : usize, write_buffer_length : usize, read_buffer_length : usize, shead : bool, scont : bool) {
+fn tunnel_public_test(nbpeer : usize, tmode : TunnelShadowMode, input_length : usize, write_buffer_length : usize, read_buffer_length : usize, shead : ASymSymMode, scont : ASymSymMode) {
   let tmode = TunnelMode::PublicTunnel((nbpeer as u8) - 1,tmode);
   let mut route = Vec::new();
   let pt = peer_tests();
@@ -767,22 +891,22 @@ fn peer_tests () -> Vec<RSAPeerTest> {
 }
 #[test]
 fn tunnel_nohop_publictunnel_1() {
-  tunnel_public_test(2, TunnelShadowMode::Last, 500, 360, 130, true, true);
+  tunnel_public_test(2, TunnelShadowMode::Last, 500, 360, 130, ASymSymMode::ASymSym, ASymSymMode::ASymSym);
 }
 #[test]
 fn tunnel_onehop_publictunnel_1() {
-  tunnel_public_test(3, TunnelShadowMode::Last, 500, 360, 130, true, true);
+  tunnel_public_test(3, TunnelShadowMode::Last, 500, 360, 130, ASymSymMode::ASymSym, ASymSymMode::ASymSym);
 }
 #[test]
 fn tunnel_onehop_publictunnel_2() {
-  tunnel_public_test(3, TunnelShadowMode::Full, 500, 130, 360, true, true);
+  tunnel_public_test(3, TunnelShadowMode::Full, 500, 130, 360, ASymSymMode::ASymSym, ASymSymMode::ASymSym);
 }
 #[test]
 fn tunnel_fourhop_publictunnel_2() {
-  tunnel_public_test(6, TunnelShadowMode::Full, 500, 130, 360, true, true);
+  tunnel_public_test(6, TunnelShadowMode::Full, 500, 130, 360, ASymSymMode::ASymSym, ASymSymMode::ASymSym);
 }
 #[test]
 fn tunnel_fourhop_publictunnel_3() {
-  tunnel_public_test(4, TunnelShadowMode::Last, 500, 130, 360, true, true);
+  tunnel_public_test(4, TunnelShadowMode::Last, 500, 130, 360, ASymSymMode::ASymSym, ASymSymMode::ASymSym);
 }
 
