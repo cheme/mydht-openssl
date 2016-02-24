@@ -120,6 +120,7 @@ pub trait RSATruster : KeyVal<Key=Vec<u8>> {
   const RSA_SIZE : usize;
   const SHADOW_TYPE : SymmType;
   const CRYPTER_KEY_ENC_SIZE : usize;
+  const CRYPTER_KEY_DEC_SIZE : usize;
   const CRYPTER_BLOCK_SIZE : usize;
   const CRYPTER_KEY_SIZE : usize;
 
@@ -264,11 +265,23 @@ impl<RT : RSATruster> AESShadower<RT> {
     }
   }
   #[inline]
-  fn crypt_buf (&mut self, sym : bool) -> Vec<u8> {
+  fn crypt_buf (&mut self, bix : usize, sym : bool) -> Vec<u8> {
     if sym {
-      self.crypter.update(&self.buf[..])
+      self.crypter.update(&self.buf[..bix])
     } else {
-      (*self.keyexch).encrypt(&self.buf[..])
+      (*self.keyexch).encrypt(&self.buf[..bix])
+    }
+  }
+  #[inline]
+  fn buf_size (&mut self, w : bool) -> usize {
+    if let ASymSymMode::ASymOnly = self.mode {
+      if w {
+        <RT as RSATruster>::CRYPTER_KEY_DEC_SIZE
+      } else {
+        <RT as RSATruster>::CRYPTER_KEY_ENC_SIZE
+      }
+    } else {
+      <RT as RSATruster>::CRYPTER_BLOCK_SIZE
     }
   }
 
@@ -280,8 +293,9 @@ impl<RT : RSATruster> AESShadower<RT> {
     match self.mode {
     ASymSymMode::ASymSym | ASymSymMode::ASymOnly => {
       let sym = self.mode == ASymSymMode::ASymSym;
+      let bsize = self.buf_size(true);
     // best case
-    if self.bufix == 0 && m.len() == <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
+    if self.bufix == 0 && m.len() == bsize {
       let r = self.crypt(m,sym);
       w.write(&r[..])
     } else {
@@ -290,7 +304,7 @@ impl<RT : RSATruster> AESShadower<RT> {
       let mut res = 0;
       while has_next {
         let nbufix = self.bufix + mu.len();
-        if nbufix < <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
+        if nbufix < bsize {
           has_next = false;
           self.buf[self.bufix..nbufix].clone_from_slice(&mu[..]);
           res += mu.len();
@@ -299,9 +313,9 @@ impl<RT : RSATruster> AESShadower<RT> {
           let mix = self.buf.len() - self.bufix;
           self.buf[self.bufix..].clone_from_slice(&mu[..mix]); // TODO no need to copy if same length : update directly on mu then update mu
           mu = &mu[mix..];
-          let r = self.crypt_buf(sym);
-          res += try!(w.write(&r[..]));
-          res -= self.bufix;
+          let r = self.crypt_buf(bsize,sym);
+          try!(w.write_all(&r[..]));
+          res += mix;
           self.bufix = 0;
         }
       }
@@ -336,6 +350,7 @@ impl<RT : RSATruster> AESShadower<RT> {
   fn read_shadow_iter_sim<R : Read> (&mut self, r : &mut R, resbuf: &mut [u8]) -> IoResult<usize> {
     match self.mode {
     ASymSymMode::ASymSym | ASymSymMode::ASymOnly => {
+      let bsize = self.buf_size(false);
       let sym = self.mode == ASymSymMode::ASymSym;
    
 /*      if self.bufix == self.buf.len() {
@@ -353,7 +368,7 @@ impl<RT : RSATruster> AESShadower<RT> {
           s = try!(r.read(&mut self.buf[self.bufix..]));
           self.bufix += s;
         }
-        let dec = if self.bufix < <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
+        let dec = if self.bufix < bsize {
           // nothing to read, finalize
           let dec = self.dfinalize(sym);
           self.finalize = true;
@@ -373,16 +388,16 @@ impl<RT : RSATruster> AESShadower<RT> {
           dec
         };
 
-        assert!(dec.len() > 0 && dec.len() <= <RT as RSATruster>::CRYPTER_BLOCK_SIZE );
-        if dec.len() == <RT as RSATruster>::CRYPTER_BLOCK_SIZE {
+        assert!(dec.len() > 0 && dec.len() <= bsize );
+        if dec.len() == bsize {
           self.buf = dec;
           self.bufix = 0;
         } else {
-          self.bufix = <RT as RSATruster>::CRYPTER_BLOCK_SIZE - dec.len();
+          self.bufix = bsize - dec.len();
           self.buf[self.bufix..].clone_from_slice(&dec[..]);
         }
       }
-      let tow = <RT as RSATruster>::CRYPTER_BLOCK_SIZE - self.bufix;
+      let tow = bsize - self.bufix;
       // write result
       if resbuf.len() < tow {
         let l = self.bufix + resbuf.len();
@@ -408,7 +423,7 @@ impl<RT : RSATruster> AESShadower<RT> {
       let sym = self.mode == ASymSymMode::ASymSym;
       if self.bufix > 0 {
         let bix = self.bufix;
-        let r = self.decrypt_buf(bix,sym);
+        let r = self.crypt_buf(bix,sym);
         try!(w.write(&r[..]));
       }
       // always finalize (padding)
@@ -430,7 +445,7 @@ impl<RT : RSATruster> AESShadower<RT> {
 #[derive(Debug, PartialEq, Eq, Clone,RustcEncodable,RustcDecodable)]
 pub enum ASymSymMode {
   /// standard for encoding, a symetric key send into an asym envelope (good for big message)
-  ASymSym, 
+  ASymSym,
   /// only asym encoding : only use for small messages
   ASymOnly,
   /// No enc
@@ -450,9 +465,9 @@ impl<RT : RSATruster> Shadow for AESShadower<RT> {
         }
     },
     ASymSymMode::ASymOnly => {
-
-        if self.buf.len() != <RT as RSATruster>::CRYPTER_KEY_ENC_SIZE {
-          self.buf = vec![0;<RT as RSATruster>::CRYPTER_KEY_ENC_SIZE];
+        // set_mode is for write (read is read from header)
+        if self.buf.len() != <RT as RSATruster>::CRYPTER_KEY_DEC_SIZE {
+          self.buf = vec![0;<RT as RSATruster>::CRYPTER_KEY_DEC_SIZE];
         }
     },
     _ => (),
@@ -565,11 +580,11 @@ impl<RT : RSATruster> ExtWrite for AESShadower<RT> {
  
   #[inline]
   fn write_end<W : Write>(&mut self, w : &mut W) -> IoResult<()> {
-    if let ASymSymMode::ASymSym = self.mode {
-      self.c_finalize(w)
-    } else {
+    if let ASymSymMode::None = self.mode {
       //w.flush()
       Ok(())
+    } else {
+      self.c_finalize(w)
     }
   }
 
@@ -706,6 +721,7 @@ impl RSATruster for RSAPeerTest {
   const CRYPTER_BLOCK_SIZE : usize = 16;
   const CRYPTER_KEY_SIZE : usize = 32;
   const CRYPTER_KEY_ENC_SIZE : usize = 256;
+  const CRYPTER_KEY_DEC_SIZE : usize = 214;
 
 #[inline]
   fn get_pkey<'a>(&'a self) -> &'a PKeyExt {
@@ -738,7 +754,7 @@ impl Peer for RSAPeerTest {
   }
   #[inline]
   fn default_header_mode (&self) -> <Self::Shadow as Shadow>::ShadowMode {
-    ASymSymMode::ASymSym// TODO add a sym only mode
+    ASymSymMode::ASymOnly
   }
   #[inline]
   fn default_auth_mode (&self) ->  <Self::Shadow as Shadow>::ShadowMode {
@@ -838,7 +854,6 @@ fn rsa_shadower9_test () {
   let read_buffer_length = <RSAPeerTest as RSATruster>::CRYPTER_BLOCK_SIZE;
   rsa_shadower_test (input_length, write_buffer_length, read_buffer_length, smode);
 }
-/*
 #[test]
 fn rsa_shadowera_test () {
   let smode = ASymSymMode::ASymOnly;
@@ -860,12 +875,11 @@ fn rsa_shadowerb_test () {
 #[test]
 fn rsa_shadowerc_test () {
   let smode = ASymSymMode::ASymOnly;
-  let input_length = 125;
+  let input_length = 700;
   let write_buffer_length = 68;
   let read_buffer_length = 12;
   rsa_shadower_test (input_length, write_buffer_length, read_buffer_length, smode);
 }
-*/
 
 #[cfg(test)]
 fn tunnel_public_test(nbpeer : usize, tmode : TunnelShadowMode, input_length : usize, write_buffer_length : usize, read_buffer_length : usize, shead : ASymSymMode, scont : ASymSymMode) {
@@ -891,7 +905,7 @@ fn peer_tests () -> Vec<RSAPeerTest> {
 }
 #[test]
 fn tunnel_nohop_publictunnel_1() {
-  tunnel_public_test(2, TunnelShadowMode::Last, 500, 360, 130, ASymSymMode::ASymSym, ASymSymMode::ASymSym);
+  tunnel_public_test(2, TunnelShadowMode::Last, 500, 360, 130, ASymSymMode::ASymOnly, ASymSymMode::ASymSym);
 }
 #[test]
 fn tunnel_onehop_publictunnel_1() {
@@ -907,6 +921,45 @@ fn tunnel_fourhop_publictunnel_2() {
 }
 #[test]
 fn tunnel_fourhop_publictunnel_3() {
-  tunnel_public_test(4, TunnelShadowMode::Last, 500, 130, 360, ASymSymMode::ASymSym, ASymSymMode::ASymSym);
+  tunnel_public_test(4, TunnelShadowMode::Last, 500, 130, 360, ASymSymMode::ASymOnly, ASymSymMode::ASymSym);
+}
+#[test]
+fn asym_test () {
+    let mut pkey = PKey::new();
+    pkey.gen(2048);
+    let input = [1,2,3,4,5];
+    let out = pkey.encrypt(&input);
+    let in2 = pkey.decrypt(&out);
+    assert_eq!(&input[..],&in2[..]);
+    let out = pkey.encrypt(&input);
+    let in2 = pkey.decrypt(&out);
+    assert_eq!(&input[..],&in2[..]);
+    let out = pkey.encrypt(&input);
+    let in2 = pkey.decrypt(&out);
+    assert_eq!(&input[..],&in2[..]);
+    let input_length = 500;
+    let buff = 214; // max buf l TODO check in impl
+    let mut inputb = vec![0;input_length];
+    OsRng::new().unwrap().fill_bytes(&mut inputb);
+    let mut ix = 0;
+//    let mut tot = 0;
+    while ix < input_length {
+    let out = if ix + buff < input_length {
+      pkey.encrypt(&inputb[ix..ix + buff])
+    } else {
+      pkey.encrypt(&inputb[ix..])
+    };
+//    tot += out.len();
+    let in2 = pkey.decrypt(&out);
+    if ix + buff < input_length {
+    assert_eq!(&inputb[ix..ix + buff],&in2[..]);
+    } else {
+    assert_eq!(&inputb[ix..],&in2[..]);
+    };
+    ix += buff;
+    }
+//    assert!(false)
+ 
+ 
 }
 
